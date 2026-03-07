@@ -6,9 +6,9 @@ import { listOldObjects, deleteFromR2 } from "@/lib/r2";
 const CRON_SECRET = process.env.CRON_SECRET;
 
 export async function GET(request: NextRequest) {
-  // Verify cron secret (Vercel cron sends this header)
+  // Always require auth — deny by default if secret not configured
   const authHeader = request.headers.get("authorization");
-  if (CRON_SECRET && authHeader !== `Bearer ${CRON_SECRET}`) {
+  if (!CRON_SECRET || authHeader !== `Bearer ${CRON_SECRET}`) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 

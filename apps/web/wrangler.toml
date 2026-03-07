@@ -5,7 +5,8 @@ pages_build_output_dir = ".vercel/output/static"
 
 [vars]
 R2_ACCOUNT_ID = "b91a876a73f55ea949fc9ef10a20c02d"
-R2_ACCESS_KEY_ID = "5b10cf022dd0598c580f22c2e7eefed8"
 R2_BUCKET_NAME = "qallab-files"
 CONVERTER_SERVICE_URL = "https://qallab.onrender.com"
-CONVERTER_API_KEY = "qallab-converter-key-2024"
+# Secrets are stored as encrypted Cloudflare Pages secrets via wrangler pages secret put:
+# R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, UPSTASH_REDIS_REST_URL,
+# UPSTASH_REDIS_REST_TOKEN, CONVERTER_API_KEY, CRON_SECRET
