@@ -5,6 +5,7 @@ import { v4 as uuidv4 } from "uuid";
 import { createJob, updateJob } from "@/lib/jobs";
 import { MAX_FILE_SIZE_BYTES, MAGIC_BYTES } from "@/lib/validators";
 import type { ConversionType } from "@/lib/validators";
+import { getOptionalRequestContext } from "@cloudflare/next-on-pages";
 
 const CONVERTER_URL = process.env.CONVERTER_SERVICE_URL;
 const CONVERTER_API_KEY = process.env.CONVERTER_API_KEY;
@@ -126,8 +127,17 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "general" }, { status: 500 });
   }
 
-  // Run conversion in background (don't await)
-  convertViaExternalService(jobId, conversionType, bytes, file.type, file.name);
+  // Use ctx.waitUntil() so Cloudflare Workers keeps the worker alive
+  // until conversion completes (fire-and-forget doesn't work in edge runtime)
+  const cfContext = getOptionalRequestContext();
+  if (cfContext?.ctx?.waitUntil) {
+    cfContext.ctx.waitUntil(
+      convertViaExternalService(jobId, conversionType, bytes, file.type, file.name)
+    );
+  } else {
+    // Fallback for local dev (Node.js runtime)
+    convertViaExternalService(jobId, conversionType, bytes, file.type, file.name);
+  }
 
   return NextResponse.json({ jobId }, { status: 202 });
 }
