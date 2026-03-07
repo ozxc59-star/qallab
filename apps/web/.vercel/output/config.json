@@ -43,7 +43,7 @@
       "continue": true
     },
     {
-      "src": "^/_next/data/C2eYCiii0gyO\\-Y0cG7jI\\-/(.*).json",
+      "src": "^/_next/data/P1u9EMLtsff2To7Ty2l2U/(.*).json",
       "dest": "/$1",
       "override": true,
       "continue": true,
@@ -73,7 +73,7 @@
         {
           "type": "header",
           "key": "x-prerender-revalidate",
-          "value": "2528ca09e633e02d2b41ad2936136f40"
+          "value": "52d642549b0e508038cd21aeba8852c9"
         }
       ],
       "middlewarePath": "middleware",
@@ -90,7 +90,7 @@
           "key": "x-nextjs-data"
         }
       ],
-      "dest": "/_next/data/C2eYCiii0gyO-Y0cG7jI-/index.json",
+      "dest": "/_next/data/P1u9EMLtsff2To7Ty2l2U/index.json",
       "continue": true,
       "override": true
     },
@@ -102,7 +102,7 @@
           "key": "x-nextjs-data"
         }
       ],
-      "dest": "/_next/data/C2eYCiii0gyO-Y0cG7jI-/$1.json",
+      "dest": "/_next/data/P1u9EMLtsff2To7Ty2l2U/$1.json",
       "continue": true,
       "override": true
     },
@@ -142,7 +142,7 @@
       "handle": "filesystem"
     },
     {
-      "src": "^/_next/data/C2eYCiii0gyO\\-Y0cG7jI\\-/(.*).json",
+      "src": "^/_next/data/P1u9EMLtsff2To7Ty2l2U/(.*).json",
       "dest": "/$1",
       "continue": true,
       "has": [
@@ -218,7 +218,7 @@
           "key": "x-nextjs-data"
         }
       ],
-      "dest": "/_next/data/C2eYCiii0gyO-Y0cG7jI-/index.json",
+      "dest": "/_next/data/P1u9EMLtsff2To7Ty2l2U/index.json",
       "continue": true
     },
     {
@@ -229,27 +229,27 @@
           "key": "x-nextjs-data"
         }
       ],
-      "dest": "/_next/data/C2eYCiii0gyO-Y0cG7jI-/$1.json",
+      "dest": "/_next/data/P1u9EMLtsff2To7Ty2l2U/$1.json",
       "continue": true
     },
     {
-      "src": "^/_next/data/C2eYCiii0gyO\\-Y0cG7jI\\-/api/download/(?<nxtPjobId>[^/]+?)(?:/)?.json$",
+      "src": "^/_next/data/P1u9EMLtsff2To7Ty2l2U/api/download/(?<nxtPjobId>[^/]+?)(?:/)?.json$",
       "dest": "/api/download/[jobId]?nxtPjobId=$nxtPjobId"
     },
     {
-      "src": "^/_next/data/C2eYCiii0gyO\\-Y0cG7jI\\-/api/jobs/(?<nxtPjobId>[^/]+?)(?:/)?.json$",
+      "src": "^/_next/data/P1u9EMLtsff2To7Ty2l2U/api/jobs/(?<nxtPjobId>[^/]+?)(?:/)?.json$",
       "dest": "/api/jobs/[jobId]?nxtPjobId=$nxtPjobId"
     },
     {
-      "src": "^/_next/data/C2eYCiii0gyO\\-Y0cG7jI\\-/(?<nxtPlocale>[^/]+?)(?:/)?.json$",
+      "src": "^/_next/data/P1u9EMLtsff2To7Ty2l2U/(?<nxtPlocale>[^/]+?)(?:/)?.json$",
       "dest": "/[locale]?nxtPlocale=$nxtPlocale"
     },
     {
-      "src": "^/_next/data/C2eYCiii0gyO\\-Y0cG7jI\\-/(?<nxtPlocale>[^/]+?)/convert(?:/)?.json$",
+      "src": "^/_next/data/P1u9EMLtsff2To7Ty2l2U/(?<nxtPlocale>[^/]+?)/convert(?:/)?.json$",
       "dest": "/[locale]/convert?nxtPlocale=$nxtPlocale"
     },
     {
-      "src": "^/_next/data/C2eYCiii0gyO\\-Y0cG7jI\\-/(?<nxtPlocale>[^/]+?)/pricing(?:/)?.json$",
+      "src": "^/_next/data/P1u9EMLtsff2To7Ty2l2U/(?<nxtPlocale>[^/]+?)/pricing(?:/)?.json$",
       "dest": "/[locale]/pricing?nxtPlocale=$nxtPlocale"
     },
     {
@@ -293,7 +293,7 @@
       "dest": "/[locale]/pricing?nxtPlocale=$nxtPlocale"
     },
     {
-      "src": "^/_next/data/C2eYCiii0gyO\\-Y0cG7jI\\-/(.*).json",
+      "src": "^/_next/data/P1u9EMLtsff2To7Ty2l2U/(.*).json",
       "headers": {
         "x-nextjs-matched-path": "/$1"
       },
@@ -301,14 +301,14 @@
       "override": true
     },
     {
-      "src": "^/_next/data/C2eYCiii0gyO\\-Y0cG7jI\\-/(.*).json",
+      "src": "^/_next/data/P1u9EMLtsff2To7Ty2l2U/(.*).json",
       "dest": "__next_data_catchall"
     },
     {
       "handle": "hit"
     },
     {
-      "src": "/_next/static/(?:[^/]+/pages|pages|chunks|runtime|css|image|media|C2eYCiii0gyO\\-Y0cG7jI\\-)/.+",
+      "src": "/_next/static/(?:[^/]+/pages|pages|chunks|runtime|css|image|media|P1u9EMLtsff2To7Ty2l2U)/.+",
       "headers": {
         "cache-control": "public,max-age=31536000,immutable"
       },
@@ -408,7 +408,7 @@
     }
   },
   "framework": {
-    "version": "15.2.4"
+    "version": "15.2.8"
   },
   "crons": []
 }
