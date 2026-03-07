@@ -17,25 +17,34 @@ export interface Job {
   updatedAt: number;
 }
 
-const JOB_TTL_SECONDS = 3600; // 1 hour
+const JOB_TTL_SECONDS = 3600;
 const JOB_PREFIX = "job:";
 
-// ---------- Redis (Upstash) ----------
+// ---------- Upstash Redis via raw REST fetch (no cache option issue) ----------
 
-async function getRedis() {
-  if (
-    !process.env.UPSTASH_REDIS_REST_URL ||
-    !process.env.UPSTASH_REDIS_REST_TOKEN
-  ) {
-    throw new Error(
-      "Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN"
-    );
+async function redisCommand(command: unknown[]): Promise<unknown> {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+  if (!url || !token) {
+    throw new Error("Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN");
   }
-  const { Redis } = await import("@upstash/redis");
-  return new Redis({
-    url: process.env.UPSTASH_REDIS_REST_URL,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN,
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(command),
   });
+
+  if (!res.ok) {
+    throw new Error(`Redis error: ${res.status} ${await res.text()}`);
+  }
+
+  const data = await res.json() as { result: unknown };
+  return data.result;
 }
 
 // ---------- Public API ----------
@@ -52,16 +61,12 @@ export async function createJob(
     updatedAt: now,
     ...data,
   };
-
-  const redis = await getRedis();
-  await redis.setex(`${JOB_PREFIX}${id}`, JOB_TTL_SECONDS, JSON.stringify(job));
-
+  await redisCommand(["SETEX", `${JOB_PREFIX}${id}`, JOB_TTL_SECONDS, JSON.stringify(job)]);
   return job;
 }
 
 export async function getJob(id: string): Promise<Job | null> {
-  const redis = await getRedis();
-  const raw = await redis.get<string>(`${JOB_PREFIX}${id}`);
+  const raw = await redisCommand(["GET", `${JOB_PREFIX}${id}`]) as string | null;
   if (!raw) return null;
   return typeof raw === "string" ? JSON.parse(raw) : raw;
 }
@@ -79,12 +84,6 @@ export async function updateJob(
     updatedAt: Date.now(),
   };
 
-  const redis = await getRedis();
-  await redis.setex(
-    `${JOB_PREFIX}${id}`,
-    JOB_TTL_SECONDS,
-    JSON.stringify(updated)
-  );
-
+  await redisCommand(["SETEX", `${JOB_PREFIX}${id}`, JOB_TTL_SECONDS, JSON.stringify(updated)]);
   return updated;
 }

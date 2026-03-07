@@ -116,11 +116,15 @@ export async function POST(request: NextRequest) {
   const jobId = uuidv4();
   const outputFileName = getOutputFileName(file.name, conversionType);
 
-  await createJob(jobId, {
-    conversionType,
-    originalFileName: file.name,
-    outputFileName,
-  });
+  try {
+    await createJob(jobId, {
+      conversionType,
+      originalFileName: file.name,
+      outputFileName,
+    });
+  } catch {
+    return NextResponse.json({ error: "general" }, { status: 500 });
+  }
 
   // Run conversion in background (don't await)
   convertViaExternalService(jobId, conversionType, bytes, file.type, file.name);

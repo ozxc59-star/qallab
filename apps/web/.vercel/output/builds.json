@@ -3,7 +3,7 @@
   "target": "preview",
   "argv": [
     "/opt/homebrew/Cellar/node@22/22.22.1/bin/node",
-    "/Users/mac/Desktop/qallab/node_modules/.pnpm/vercel@47.0.4/node_modules/vercel/dist/vc.js",
+    "/Users/mac/Desktop/qallab/apps/web/node_modules/vercel/dist/vc.js",
     "build"
   ],
   "builds": [

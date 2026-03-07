@@ -41,6 +41,7 @@
     "../../node_modules/.pnpm/next@15.2.8_react-dom@18.3.1_react@18.3.1__react@18.3.1/node_modules/next/dist/server/route-modules/pages/vendored/contexts/server-inserted-html.js": "../../node_modules/.pnpm/next@15.2.8_react-dom@18.3.1_react@18.3.1__react@18.3.1/node_modules/next/dist/server/route-modules/pages/vendored/contexts/server-inserted-html.js",
     "../../node_modules/.pnpm/next@15.2.8_react-dom@18.3.1_react@18.3.1__react@18.3.1/node_modules/next/dist/server/route-modules/pages/module.compiled.js": "../../node_modules/.pnpm/next@15.2.8_react-dom@18.3.1_react@18.3.1__react@18.3.1/node_modules/next/dist/server/route-modules/pages/module.compiled.js",
     ".next/server/pages/404.html": ".next/server/pages/404.html",
+    ".env.production": ".env.production",
     ".next/build-manifest.json": ".next/build-manifest.json",
     ".next/prerender-manifest.json": ".next/prerender-manifest.json",
     ".next/server/functions-config-manifest.json": ".next/server/functions-config-manifest.json",
