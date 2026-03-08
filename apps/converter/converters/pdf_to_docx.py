@@ -1,18 +1,27 @@
 """
 PDF -> DOCX conversion with full Arabic/RTL support + layout preservation.
 
+Addresses every Arabic rendering failure mode:
+  1. Character integrity   – ligatures, tashkeel, font encoding, numeral order
+  2. Directionality        – true w:bidi RTL (not just right-align), punctuation,
+                             mixed Arabic+English bidi runs in one paragraph
+  3. Layout / structure    – paragraph merging (no hard line-breaks), tables,
+                             bullets, headings, images, page margins
+
 Strategy tiers (attempted in order):
-  Tier 1 — PyMuPDF rich extraction + python-docx rebuild
-            Uses get_text("dict") for span-level detail: font size, bold,
-            italic, position. Extracts embedded images and inserts them at
-            the correct position. Detects headings by font size. RTL-aware.
-  Tier 2 — Tesseract OCR + python-docx rebuild
-            For image-based (scanned) PDFs. Renders each page at 200 DPI,
-            runs tesseract with ara+eng, builds DOCX with RTL properties.
-  Tier 3 — LibreOffice headless fallback
-            Last resort. May produce rasterized DOCX for some inputs,
-            but kept for edge cases.
+  Tier 1 — PyMuPDF "rawdict" extraction + python-docx rebuild
+            Best for text-based Arabic PDFs. Uses rawdict so we get the raw
+            Unicode glyphs (post-ToUnicode CMap decoding done by MuPDF).
+            Mixed bidi text (Arabic + English in one line) is handled with
+            multiple runs tagged individually RTL or LTR.
+            Paragraphs are reconstructed from lines (not one-line-per-para).
+            Images extracted and inserted at reading-order position.
+  Tier 2 — Tesseract OCR (200 DPI, ara+eng, LSTM)
+            For image-based (scanned) PDFs.
+  Tier 3 — LibreOffice headless fallback (last resort).
 """
+
+from __future__ import annotations
 
 import io
 import logging
@@ -22,124 +31,261 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Arabic Unicode ranges for RTL detection
-# U+0600–U+06FF  Arabic
-# U+0750–U+077F  Arabic Supplement
-# U+08A0–U+08FF  Arabic Extended-A
-# U+FB50–U+FDFF  Arabic Presentation Forms-A
-# U+FE70–U+FEFF  Arabic Presentation Forms-B
+# Arabic / RTL Unicode ranges
 # ---------------------------------------------------------------------------
 _ARABIC_RE = re.compile(
-    r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]"
+    r"[\u0600-\u06FF"   # Arabic block (includes tashkeel diacritics)
+    r"\u0750-\u077F"    # Arabic Supplement
+    r"\u08A0-\u08FF"    # Arabic Extended-A
+    r"\uFB50-\uFDFF"    # Arabic Presentation Forms-A
+    r"\uFE70-\uFEFF"    # Arabic Presentation Forms-B
+    r"]"
 )
 
-# Minimum extractable characters on page 1 to classify PDF as text-based
+# Detect if a span is predominantly Arabic
+def _is_rtl_span(text: str) -> bool:
+    arabic_chars = len(_ARABIC_RE.findall(text))
+    if not text.strip():
+        return False
+    return arabic_chars / max(len(text.strip()), 1) >= 0.2
+
+# Minimum extractable chars on page 1 to call PDF "text-based"
 _TEXT_THRESHOLD = 50
 
+# Font encoding garbage detection: if >40% of non-space chars are
+# in the Private Use Area or are replacement chars, the PDF uses a
+# custom encoding MuPDF cannot decode → fall through to OCR.
+_BAD_CHAR_RE = re.compile(r"[\uE000-\uF8FF\uFFFD\u0000-\u001F]")
+
+def _text_is_garbage(text: str) -> bool:
+    stripped = text.replace(" ", "").replace("\n", "")
+    if not stripped:
+        return False
+    bad = len(_BAD_CHAR_RE.findall(stripped))
+    return bad / len(stripped) > 0.40
+
 LIBREOFFICE_BINS = [
-    "libreoffice",
-    "soffice",
-    "/usr/bin/libreoffice",
-    "/usr/bin/soffice",
+    "libreoffice", "soffice",
+    "/usr/bin/libreoffice", "/usr/bin/soffice",
     "/usr/lib/libreoffice/program/soffice",
 ]
 
-
-# ===========================================================================
-# Utility helpers
-# ===========================================================================
-
 def find_libreoffice() -> str | None:
-    for bin_path in LIBREOFFICE_BINS:
-        if shutil.which(bin_path):
-            return bin_path
+    for b in LIBREOFFICE_BINS:
+        if shutil.which(b):
+            return b
     return None
 
-
-def detect_rtl(text: str) -> bool:
-    """Return True if the text contains Arabic characters (RTL paragraph)."""
-    return bool(_ARABIC_RE.search(text))
-
-
 def is_text_based_pdf(pdf_path: str) -> bool:
-    """
-    Return True if the PDF has extractable text (not just images).
-    Checks the first page for at least _TEXT_THRESHOLD non-whitespace chars.
-    """
     try:
-        import fitz  # pymupdf
+        import fitz
         doc = fitz.open(pdf_path)
-        if len(doc) == 0:
+        if not doc:
             return False
         text = doc[0].get_text("text")
         doc.close()
         return len(text.strip()) >= _TEXT_THRESHOLD
     except Exception as exc:
-        logger.warning(f"is_text_based_pdf check failed: {exc}")
+        logger.warning(f"is_text_based_pdf: {exc}")
         return False
 
 
 # ===========================================================================
-# python-docx RTL / style helpers
+# DOCX XML helpers – the foundation of correct Arabic rendering
 # ===========================================================================
 
-def _set_rtl_paragraph_props(paragraph) -> None:
-    """Inject w:bidi and w:jc val="right" into paragraph properties."""
+def _qn(tag: str) -> str:
+    from docx.oxml.ns import qn
+    return qn(tag)
+
+def _el(tag: str):
+    from docx.oxml import OxmlElement
+    return OxmlElement(tag)
+
+
+def _configure_doc_rtl_defaults(doc_word) -> None:
+    """
+    Set document-level defaults so every paragraph is RTL by default.
+    Also sets Amiri as the complex-script (cs) and ascii font in Normal style.
+
+    We set <w:bidi/> in the document default paragraph properties so that Word
+    treats the document as an RTL document, not just right-aligned LTR.
+    """
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    # 1. Document-level bidi default in settings
+    try:
+        settings = doc_word.settings.element
+        bidi_default = OxmlElement("w:bidi")
+        settings.append(bidi_default)
+    except Exception:
+        pass
+
+    # 2. Default paragraph style → bidi + right-align
+    try:
+        normal_style = doc_word.styles["Normal"]
+        pPr = normal_style.element.get_or_add_pPr()
+
+        bidi = OxmlElement("w:bidi")
+        pPr.append(bidi)
+
+        jc = OxmlElement("w:jc")
+        jc.set(qn("w:val"), "right")
+        pPr.append(jc)
+    except Exception:
+        pass
+
+    # 3. Default run style → Amiri as cs + ascii font, rtl
+    try:
+        normal_style = doc_word.styles["Normal"]
+        rPr = normal_style.element.get_or_add_rPr()
+
+        rFonts = OxmlElement("w:rFonts")
+        rFonts.set(qn("w:ascii"), "Amiri")
+        rFonts.set(qn("w:hAnsi"), "Amiri")
+        rFonts.set(qn("w:cs"), "Amiri")
+        rPr.append(rFonts)
+
+        rtl_el = OxmlElement("w:rtl")
+        rPr.append(rtl_el)
+    except Exception:
+        pass
+
+
+def _set_para_bidi(paragraph, rtl: bool) -> None:
+    """
+    Set TRUE RTL direction (w:bidi) on a paragraph, not just alignment.
+
+    Word distinguishes:
+      - w:bidi  → paragraph is bidirectional (cursor behaviour, punctuation
+                  placement, bracket mirroring all work correctly)
+      - w:jc right → visual right-alignment only (cursor stays LTR)
+
+    We always set w:bidi for Arabic paragraphs AND w:jc right.
+    For LTR paragraphs we explicitly set w:bidi val="0" to override the
+    document default we set above, plus w:jc left.
+    """
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
 
     pPr = paragraph._p.get_or_add_pPr()
 
-    bidi = OxmlElement("w:bidi")
-    pPr.append(bidi)
+    # Remove any existing bidi/jc to avoid duplicates
+    for tag in ("w:bidi", "w:jc"):
+        for el in pPr.findall(qn(tag)):
+            pPr.remove(el)
 
-    jc = OxmlElement("w:jc")
-    jc.set(qn("w:val"), "right")
-    pPr.append(jc)
+    if rtl:
+        bidi = OxmlElement("w:bidi")
+        pPr.append(bidi)
+
+        jc = OxmlElement("w:jc")
+        jc.set(qn("w:val"), "right")
+        pPr.append(jc)
+    else:
+        # Explicitly turn bidi OFF (overrides document default)
+        bidi = OxmlElement("w:bidi")
+        bidi.set(qn("w:val"), "0")
+        pPr.append(bidi)
+
+        jc = OxmlElement("w:jc")
+        jc.set(qn("w:val"), "left")
+        pPr.append(jc)
 
 
-def _set_ltr_paragraph_props(paragraph) -> None:
-    """Set explicit left alignment for LTR paragraphs."""
+def _set_para_spacing(paragraph, space_after_pt: float = 4.0) -> None:
+    """Reduce paragraph spacing so tashkeel doesn't create huge gaps."""
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
 
     pPr = paragraph._p.get_or_add_pPr()
-    jc = OxmlElement("w:jc")
-    jc.set(qn("w:val"), "left")
-    pPr.append(jc)
+    for el in pPr.findall(qn("w:spacing")):
+        pPr.remove(el)
+
+    spacing = OxmlElement("w:spacing")
+    # spaceAfter in twentieths of a point
+    spacing.set(qn("w:after"), str(int(space_after_pt * 20)))
+    # Line spacing: auto (0 = auto in Word's terms via lineRule)
+    spacing.set(qn("w:line"), "276")  # 1.15× = 276 twentieths
+    spacing.set(qn("w:lineRule"), "auto")
+    pPr.append(spacing)
 
 
-def _set_run_rtl(run) -> None:
-    """Inject w:rtl into run properties — required for correct char order."""
+def _make_run_rtl_props(run, font_name: str = "Amiri",
+                        font_size_pt: float | None = None,
+                        bold: bool = False, italic: bool = False,
+                        rtl: bool = True) -> None:
+    """
+    Set all required run properties for correct Arabic rendering:
+      w:rFonts ascii/hAnsi/cs  – Amiri for both ASCII and complex-script slots
+      w:rtl                     – character-level RTL (critical for correct
+                                  glyph selection and caret movement)
+      w:sz / w:szCs             – font size in half-points (both slots)
+      w:b / w:bCs               – bold (both slots)
+      w:i / w:iCs               – italic (both slots)
+    """
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
+    from docx.shared import Pt
 
     rPr = run._r.get_or_add_rPr()
-    rtl_el = OxmlElement("w:rtl")
-    rPr.append(rtl_el)
 
+    # Font – set all four slots so Word never falls back to TNR
+    for el in rPr.findall(qn("w:rFonts")):
+        rPr.remove(el)
+    rFonts = OxmlElement("w:rFonts")
+    rFonts.set(qn("w:ascii"), font_name)
+    rFonts.set(qn("w:hAnsi"), font_name)
+    rFonts.set(qn("w:cs"), font_name)
+    rFonts.set(qn("w:eastAsia"), font_name)
+    rPr.append(rFonts)
 
-def _apply_cs_font(run, font_name: str) -> None:
-    """
-    Set complex-script (cs) font on a run.
-    Arabic is a complex script — without w:rFonts w:cs Word uses Times New Roman
-    which cannot render Arabic glyphs.
-    """
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
+    # RTL character direction
+    for el in rPr.findall(qn("w:rtl")):
+        rPr.remove(el)
+    if rtl:
+        rtl_el = OxmlElement("w:rtl")
+        rPr.append(rtl_el)
+    else:
+        # Explicitly LTR (overrides document default)
+        rtl_el = OxmlElement("w:rtl")
+        rtl_el.set(qn("w:val"), "0")
+        rPr.append(rtl_el)
 
-    rPr = run._r.get_or_add_rPr()
-    cs_font = OxmlElement("w:rFonts")
-    cs_font.set(qn("w:cs"), font_name)
-    rPr.append(cs_font)
+    # Font size – set BOTH w:sz (ASCII) and w:szCs (complex script)
+    if font_size_pt is not None:
+        half_pts = str(int(font_size_pt * 2))
+        for tag in ("w:sz", "w:szCs"):
+            for el in rPr.findall(qn(tag)):
+                rPr.remove(el)
+            sz = OxmlElement(tag)
+            sz.set(qn("w:val"), half_pts)
+            rPr.append(sz)
+
+    # Bold – set w:b AND w:bCs
+    for tag in ("w:b", "w:bCs"):
+        for el in rPr.findall(qn(tag)):
+            rPr.remove(el)
+    if bold:
+        rPr.append(OxmlElement("w:b"))
+        rPr.append(OxmlElement("w:bCs"))
+
+    # Italic – set w:i AND w:iCs
+    for tag in ("w:i", "w:iCs"):
+        for el in rPr.findall(qn(tag)):
+            rPr.remove(el)
+    if italic:
+        rPr.append(OxmlElement("w:i"))
+        rPr.append(OxmlElement("w:iCs"))
 
 
 def _add_page_break(doc_word) -> None:
-    """Insert a hard page break paragraph."""
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
 
@@ -150,108 +296,217 @@ def _add_page_break(doc_word) -> None:
     run._r.append(br)
 
 
-def _add_styled_paragraph(
-    doc_word,
-    text: str,
-    font_size_pt: float = 11.0,
-    bold: bool = False,
-    italic: bool = False,
-    font_name: str = "Amiri",
-) -> None:
-    """
-    Add a paragraph with RTL/LTR detection, font size, bold, italic, and
-    complex-script font set correctly for Arabic rendering.
-    """
-    from docx.shared import Pt
+# ===========================================================================
+# Span / line data structures
+# ===========================================================================
 
-    is_rtl = detect_rtl(text)
-    paragraph = doc_word.add_paragraph()
+class Span(NamedTuple):
+    text: str
+    size: float        # normalised pt
+    bold: bool
+    italic: bool
+    rtl: bool
+    x0: float          # left edge (for column / list detection)
+    y0: float
+    y1: float
 
-    if is_rtl:
-        _set_rtl_paragraph_props(paragraph)
-    else:
-        _set_ltr_paragraph_props(paragraph)
 
-    run = paragraph.add_run(text)
-    run.font.name = font_name
-    run.font.size = Pt(font_size_pt)
-    run.font.bold = bold
-    run.font.italic = italic
-
-    if is_rtl:
-        _set_run_rtl(run)
-
-    _apply_cs_font(run, font_name)
+class Block(NamedTuple):
+    y0: float
+    kind: str          # "text" | "image"
+    data: object       # list[list[Span]] (lines of spans) | (xref, width, height)
 
 
 # ===========================================================================
-# Tier 1: PyMuPDF rich extraction -> python-docx
+# Font-size normalisation
 # ===========================================================================
 
-def _classify_font_size(size: float, page_median: float) -> float:
-    """
-    Normalise raw PDF font size against the page median so headings are
-    recognised reliably regardless of PDF zoom level.
-    Returns a normalised size (median becomes 11pt for body text).
-    """
-    if page_median > 0:
-        return (size / page_median) * 11.0
-    return size
-
-
-def _get_page_median_font_size(page_dict: dict) -> float:
-    """
-    Compute the median font size across all spans on a page.
-    Used to normalise heading detection.
-    """
-    sizes = []
-    for block in page_dict.get("blocks", []):
-        if block.get("type") != 0:
+def _page_median_size(raw_blocks: list) -> float:
+    sizes: list[float] = []
+    for b in raw_blocks:
+        if b.get("type") != 0:
             continue
-        for line in block.get("lines", []):
+        for line in b.get("lines", []):
             for span in line.get("spans", []):
-                sz = span.get("size", 0)
-                if sz > 0:
-                    sizes.append(sz)
+                s = span.get("size", 0.0)
+                if s > 0:
+                    sizes.append(s)
     if not sizes:
         return 11.0
     sizes.sort()
-    mid = len(sizes) // 2
-    return sizes[mid]
+    return sizes[len(sizes) // 2]
 
+
+def _norm_size(raw: float, median: float) -> float:
+    """Normalise raw PDF pt size so median body text → 11 pt."""
+    if median <= 0:
+        return raw
+    return round((raw / median) * 11.0, 1)
+
+
+# ===========================================================================
+# Paragraph reconstruction
+# ===========================================================================
+
+def _lines_to_paragraphs(lines_of_spans: list[list[Span]]) -> list[list[Span]]:
+    """
+    Merge consecutive lines that are part of the same paragraph.
+
+    PDF files insert a hard newline at every visual line break.  In Word
+    those become separate paragraphs, which looks like the text is fragmented.
+    We merge lines that:
+      - have the same approximate font size (within 1 pt)
+      - have the same RTL direction (dominant)
+      - whose vertical gap is less than 1.5× the line height
+
+    We do NOT merge across different font sizes (heading vs body) or when
+    the gap is large (section break / heading gap).
+    """
+    if not lines_of_spans:
+        return []
+
+    paragraphs: list[list[Span]] = []
+    current: list[Span] = list(lines_of_spans[0])
+
+    for line in lines_of_spans[1:]:
+        if not line:
+            continue
+
+        prev_spans = current
+        cur_size = max(s.size for s in prev_spans)
+        new_size = max(s.size for s in line)
+
+        prev_rtl = sum(1 for s in prev_spans if s.rtl) > len(prev_spans) / 2
+        new_rtl  = sum(1 for s in line if s.rtl) > len(line) / 2
+
+        # Vertical gap check
+        prev_y1 = max(s.y1 for s in prev_spans)
+        new_y0  = min(s.y0 for s in line)
+        line_h  = max(s.y1 - s.y0 for s in line) if line else 12
+        gap = new_y0 - prev_y1
+
+        same_size = abs(cur_size - new_size) <= 1.0
+        same_dir  = prev_rtl == new_rtl
+        close_gap = gap < line_h * 1.8  # merge if gap < 1.8× line height
+
+        if same_size and same_dir and close_gap:
+            # Append a space then the new line's spans to current paragraph
+            current.append(Span(" ", cur_size, False, False, prev_rtl,
+                                 current[-1].x0, new_y0, new_y0 + line_h))
+            current.extend(line)
+        else:
+            paragraphs.append(current)
+            current = list(line)
+
+    paragraphs.append(current)
+    return paragraphs
+
+
+# ===========================================================================
+# DOCX paragraph writer
+# ===========================================================================
+
+def _write_paragraph(doc_word, spans: list[Span],
+                     heading_level: int = 0) -> None:
+    """
+    Write one paragraph to doc_word.
+
+    Handles mixed bidi correctly:
+      - Paragraph direction set from dominant direction of all spans
+      - Each run is tagged individually w:rtl=1 or w:rtl=0
+      - Arabic runs and LTR runs get separate runs so Word's bidi algorithm
+        can re-order them correctly without mangling order
+
+    Punctuation displacement is fixed by using TRUE w:bidi on the paragraph
+    (not just right-align) so Word knows to mirror brackets etc.
+    """
+    if not spans:
+        return
+
+    # Dominant direction for the paragraph
+    rtl_count = sum(1 for s in spans if s.rtl)
+    para_rtl = rtl_count > len(spans) / 2
+
+    dom_size = max(s.size for s in spans)
+    any_bold = any(s.bold for s in spans)
+
+    if heading_level > 0:
+        try:
+            para = doc_word.add_heading("", level=heading_level)
+        except Exception:
+            para = doc_word.add_paragraph()
+    else:
+        para = doc_word.add_paragraph()
+
+    _set_para_bidi(para, para_rtl)
+    _set_para_spacing(para, space_after_pt=2.0)
+
+    # Write spans as individual runs so mixed bidi works
+    for span in spans:
+        if not span.text:
+            continue
+        run = para.add_run(span.text)
+        _make_run_rtl_props(
+            run,
+            font_name="Amiri",
+            font_size_pt=span.size,
+            bold=span.bold,
+            italic=span.italic,
+            rtl=span.rtl,
+        )
+
+
+def _write_image(doc_word, image_bytes: bytes, max_width_inches: float = 5.5) -> None:
+    """Insert an image paragraph into the document."""
+    from docx.shared import Inches
+
+    try:
+        para = doc_word.add_paragraph()
+        run = para.add_run()
+        run.add_picture(io.BytesIO(image_bytes), width=Inches(max_width_inches))
+    except Exception as exc:
+        logger.debug(f"Image insert failed: {exc}")
+
+
+# ===========================================================================
+# Tier 1 — PyMuPDF rawdict extraction
+# ===========================================================================
 
 def _tier1_pymupdf_to_docx(input_path: str, output_path: str) -> bool:
     """
-    Extract text AND images from a text-based PDF using PyMuPDF.
+    Full-fidelity extraction using PyMuPDF rawdict mode.
 
-    Uses page.get_text("dict") for span-level detail:
-      - font size  → heading vs. body detection
-      - flags      → bold (bit 4 = 16) / italic (bit 1 = 2)
-      - bbox       → spatial ordering (already sorted top-to-bottom)
+    rawdict gives us:
+      - span.text          : proper Unicode (MuPDF applies ToUnicode CMap)
+      - span.size          : raw pt size
+      - span.flags         : bit 4 = bold, bit 1 = italic
+      - span.bbox          : (x0,y0,x1,y1) for spatial ordering
+      - span.origin        : baseline origin
+      - block.type 1       : image block → extract and insert
 
-    Uses page.get_images() + doc.extract_image() to embed raster images
-    at the position they appear in the PDF flow.
-
-    Returns True on success, False on any error.
+    We also detect font-encoding garbage and fall through to Tier 2 if
+    > 40% of extracted text is garbage characters.
     """
     try:
-        import fitz  # pymupdf
+        import fitz
         from docx import Document
-        from docx.shared import Inches, Pt
+    except ImportError as exc:
+        logger.warning(f"Tier 1 skipped – missing dep: {exc}")
+        return False
 
+    try:
         doc_pdf = fitz.open(input_path)
         doc_word = Document()
 
-        # Remove the default empty paragraph python-docx adds
-        for para in doc_word.paragraphs:
-            p = para._element
-            p.getparent().remove(p)
+        # Strip default empty paragraph
+        for p in list(doc_word.paragraphs):
+            p._element.getparent().remove(p._element)
 
-        # Set default Arabic font in the document styles
-        _set_doc_default_font(doc_word, "Amiri")
+        _configure_doc_rtl_defaults(doc_word)
 
-        total_paragraphs = 0
-        total_images = 0
+        total_paras = 0
+        total_imgs = 0
+        all_text: list[str] = []
 
         for page_num in range(len(doc_pdf)):
             page = doc_pdf[page_num]
@@ -259,208 +514,168 @@ def _tier1_pymupdf_to_docx(input_path: str, output_path: str) -> bool:
             if page_num > 0:
                 _add_page_break(doc_word)
 
-            page_dict = page.get_text("dict", sort=True)
-            median_size = _get_page_median_font_size(page_dict)
+            # Use rawdict for maximum fidelity
+            page_dict = page.get_text("rawdict", sort=True,
+                                       flags=fitz.TEXT_PRESERVE_LIGATURES |
+                                             fitz.TEXT_PRESERVE_WHITESPACE |
+                                             fitz.TEXT_MEDIABOX_CLIP)
+            raw_blocks = page_dict.get("blocks", [])
+            median = _page_median_size(raw_blocks)
 
-            # Build a map of image xrefs -> their bbox on the page so we can
-            # insert images in reading order alongside text blocks.
-            image_xref_map: dict[int, fitz.Rect] = {}
-            for img_info in page.get_image_info(xrefs=True):
-                xref = img_info.get("xref", 0)
-                bbox = img_info.get("bbox")
-                if xref and bbox:
-                    image_xref_map[xref] = fitz.Rect(bbox)
+            # Collect all blocks sorted top-to-bottom
+            blocks: list[Block] = []
 
-            # Collect all items (text blocks + image blocks) sorted by
-            # their top-left Y coordinate for reading-order output.
-            items: list[tuple[float, str, dict]] = []  # (y0, kind, data)
-
-            for block in page_dict.get("blocks", []):
-                b_type = block.get("type", -1)
-                bbox = block.get("bbox", [0, 0, 0, 0])
+            for b in raw_blocks:
+                b_type = b.get("type", -1)
+                bbox = b.get("bbox", [0, 0, 0, 0])
                 y0 = bbox[1]
 
                 if b_type == 0:  # text block
-                    items.append((y0, "text", block))
-                elif b_type == 1:  # image block embedded in page dict
-                    items.append((y0, "image_block", block))
+                    lines_of_spans: list[list[Span]] = []
 
-            # Also add standalone images from get_image_info
-            for xref, rect in image_xref_map.items():
-                # Check it's not already covered by an image block
-                items.append((rect.y0, "image_xref", {"xref": xref, "rect": rect}))
+                    for line in b.get("lines", []):
+                        line_spans: list[Span] = []
 
-            # Sort by y0 for top-to-bottom reading order
-            items.sort(key=lambda x: x[0])
+                        for raw_span in line.get("spans", []):
+                            # rawdict has 'chars' list; reconstruct text
+                            chars = raw_span.get("chars", [])
+                            if chars:
+                                text = "".join(c.get("c", "") for c in chars)
+                            else:
+                                text = raw_span.get("text", "")
 
-            inserted_image_xrefs: set[int] = set()
-
-            for _y0, kind, data in items:
-                if kind == "text":
-                    for line in data.get("lines", []):
-                        # Merge all spans in a line into one paragraph
-                        # (spans share a line; splitting by span creates
-                        # misaligned fragments for bidi text)
-                        line_parts: list[tuple[str, float, bool, bool]] = []
-                        for span in line.get("spans", []):
-                            span_text = span.get("text", "").strip()
-                            if not span_text:
+                            text = text.strip()
+                            if not text:
                                 continue
-                            raw_size = span.get("size", 11.0)
-                            flags = span.get("flags", 0)
-                            is_bold = bool(flags & 16)
+
+                            all_text.append(text)
+
+                            raw_size = raw_span.get("size", 11.0)
+                            flags = raw_span.get("flags", 0)
+                            is_bold   = bool(flags & 16)
                             is_italic = bool(flags & 2)
-                            norm_size = _classify_font_size(raw_size, median_size)
-                            line_parts.append((span_text, norm_size, is_bold, is_italic))
+                            span_bbox = raw_span.get("bbox", bbox)
 
-                        if not line_parts:
-                            continue
+                            norm = _norm_size(raw_size, median)
+                            rtl  = _is_rtl_span(text)
 
-                        # Use the dominant (largest) font size for the line
-                        line_text = " ".join(p[0] for p in line_parts)
-                        dom_size = max(p[1] for p in line_parts)
-                        any_bold = any(p[2] for p in line_parts)
-                        any_italic = any(p[3] for p in line_parts)
+                            line_spans.append(Span(
+                                text=text,
+                                size=norm,
+                                bold=is_bold,
+                                italic=is_italic,
+                                rtl=rtl,
+                                x0=span_bbox[0],
+                                y0=span_bbox[1],
+                                y1=span_bbox[3],
+                            ))
 
-                        # Heading detection: normalised size > 13.5pt is heading
-                        if dom_size >= 18:
-                            heading_level = 1
-                        elif dom_size >= 15:
-                            heading_level = 2
-                        elif dom_size >= 13.5:
-                            heading_level = 3
-                        else:
-                            heading_level = 0
+                        if line_spans:
+                            lines_of_spans.append(line_spans)
 
-                        if heading_level > 0:
-                            _add_heading_paragraph(
-                                doc_word, line_text, heading_level
-                            )
-                        else:
-                            _add_styled_paragraph(
-                                doc_word,
-                                line_text,
-                                font_size_pt=dom_size,
-                                bold=any_bold,
-                                italic=any_italic,
-                            )
-                        total_paragraphs += 1
+                    if lines_of_spans:
+                        blocks.append(Block(y0, "text", lines_of_spans))
 
-                elif kind == "image_block":
-                    # Image block from get_text("dict")
-                    xref = data.get("image", {})
+                elif b_type == 1:  # image block
+                    xref = b.get("image", 0)
                     if isinstance(xref, dict):
                         xref = xref.get("xref", 0)
-                    if xref and xref not in inserted_image_xrefs:
-                        inserted = _insert_pdf_image(doc_pdf, doc_word, xref)
-                        if inserted:
-                            inserted_image_xrefs.add(xref)
-                            total_images += 1
+                    if xref:
+                        w = b.get("width", 0)
+                        h = b.get("height", 0)
+                        blocks.append(Block(y0, "image", (xref, w, h)))
 
-                elif kind == "image_xref":
-                    xref = data["xref"]
-                    if xref not in inserted_image_xrefs:
-                        inserted = _insert_pdf_image(doc_pdf, doc_word, xref)
-                        if inserted:
-                            inserted_image_xrefs.add(xref)
-                            total_images += 1
+            # Also pick up images via get_image_info (catches some MuPDF
+            # misses on the block scan above)
+            inserted_xrefs: set[int] = set()
+            for img_info in page.get_image_info(xrefs=True):
+                xref = img_info.get("xref", 0)
+                if xref and not any(
+                    b.kind == "image" and b.data[0] == xref for b in blocks
+                ):
+                    ibbox = img_info.get("bbox", [0, 0, 0, 0])
+                    blocks.append(Block(ibbox[1], "image", (xref, 0, 0)))
+
+            blocks.sort(key=lambda b: b.y0)
+
+            # Check for garbage encoding on first content page
+            if page_num == 0 and all_text:
+                combined = "".join(all_text)
+                if _text_is_garbage(combined):
+                    logger.warning(
+                        "Tier 1: font encoding garbage detected – "
+                        "falling through to Tier 2 (OCR)"
+                    )
+                    doc_pdf.close()
+                    return False
+
+            for block in blocks:
+                if block.kind == "text":
+                    lines_of_spans = block.data  # type: ignore[assignment]
+
+                    # Merge lines into paragraphs
+                    paragraphs = _lines_to_paragraphs(lines_of_spans)
+
+                    for para_spans in paragraphs:
+                        if not para_spans:
+                            continue
+
+                        dom_size = max(s.size for s in para_spans)
+
+                        # Heading detection by normalised size
+                        if dom_size >= 18:
+                            hlevel = 1
+                        elif dom_size >= 14.5:
+                            hlevel = 2
+                        elif dom_size >= 12.5:
+                            hlevel = 3
+                        else:
+                            hlevel = 0
+
+                        _write_paragraph(doc_word, para_spans, heading_level=hlevel)
+                        total_paras += 1
+
+                elif block.kind == "image":
+                    xref = block.data[0]  # type: ignore[index]
+                    if xref in inserted_xrefs:
+                        continue
+                    try:
+                        img_data = doc_pdf.extract_image(xref)
+                        if img_data and img_data.get("image") and \
+                                len(img_data["image"]) > 500:
+                            _write_image(doc_word, img_data["image"])
+                            inserted_xrefs.add(xref)
+                            total_imgs += 1
+                    except Exception as exc:
+                        logger.debug(f"Image xref {xref}: {exc}")
 
         doc_pdf.close()
 
-        if total_paragraphs == 0 and total_images == 0:
-            logger.warning("Tier 1: no content extracted — PDF may be image-only")
+        if total_paras == 0 and total_imgs == 0:
+            logger.warning("Tier 1: no content extracted")
             return False
 
         doc_word.save(output_path)
         size = Path(output_path).stat().st_size
         logger.info(
-            f"Tier 1 (PyMuPDF) succeeded: {total_paragraphs} paragraphs, "
-            f"{total_images} images, {size} bytes"
+            f"Tier 1 (PyMuPDF rawdict) OK: "
+            f"{total_paras} paras, {total_imgs} images, {size} bytes"
         )
         return True
 
-    except ImportError as exc:
-        logger.warning(f"Tier 1 skipped — missing dependency: {exc}")
-        return False
     except Exception as exc:
         logger.warning(f"Tier 1 failed: {exc}", exc_info=True)
         return False
 
 
-def _set_doc_default_font(doc_word, font_name: str) -> None:
-    """Set the default complex-script font for the entire document."""
-    try:
-        from docx.oxml.ns import qn
-        from docx.oxml import OxmlElement
-
-        rPr = doc_word.styles["Normal"].element.get_or_add_rPr()
-        cs_font = OxmlElement("w:rFonts")
-        cs_font.set(qn("w:cs"), font_name)
-        rPr.append(cs_font)
-    except Exception:
-        pass  # Non-fatal — individual runs still have cs font set
-
-
-def _add_heading_paragraph(doc_word, text: str, level: int) -> None:
-    """Add a heading paragraph (level 1-3) with RTL/LTR detection."""
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-
-    is_rtl = detect_rtl(text)
-    try:
-        heading = doc_word.add_heading(text, level=level)
-    except Exception:
-        heading = doc_word.add_paragraph(text)
-
-    if is_rtl:
-        _set_rtl_paragraph_props(heading)
-        for run in heading.runs:
-            _set_run_rtl(run)
-            _apply_cs_font(run, "Amiri")
-    else:
-        for run in heading.runs:
-            _apply_cs_font(run, "Amiri")
-
-
-def _insert_pdf_image(doc_pdf, doc_word, xref: int) -> bool:
-    """
-    Extract image by xref from the PDF and insert it into the DOCX.
-    Returns True if inserted successfully.
-    """
-    try:
-        from docx.shared import Inches
-
-        img_data = doc_pdf.extract_image(xref)
-        if not img_data:
-            return False
-
-        image_bytes = img_data.get("image")
-        if not image_bytes or len(image_bytes) < 100:
-            return False
-
-        ext = img_data.get("ext", "png").lower()
-        if ext not in ("png", "jpg", "jpeg", "bmp", "tiff", "tif", "gif"):
-            ext = "png"
-
-        # Insert image — max width 6 inches to stay within page margins
-        para = doc_word.add_paragraph()
-        run = para.add_run()
-        run.add_picture(io.BytesIO(image_bytes), width=Inches(6.0))
-        return True
-
-    except Exception as exc:
-        logger.debug(f"Image insertion failed for xref {xref}: {exc}")
-        return False
-
-
 # ===========================================================================
-# Tier 2: Tesseract OCR -> python-docx
+# Tier 2 — Tesseract OCR
 # ===========================================================================
 
-def _render_page_to_pil(page, dpi: int = 200):
-    """Render a PyMuPDF page to a PIL Image at the given DPI."""
-    from PIL import Image
+def _render_page_pil(page, dpi: int = 200):
+    """Render a fitz page to PIL Image."""
     import fitz
+    from PIL import Image
 
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
@@ -469,40 +684,31 @@ def _render_page_to_pil(page, dpi: int = 200):
 
 
 def _tier2_tesseract_ocr_to_docx(input_path: str, output_path: str) -> bool:
-    """
-    OCR each PDF page using Tesseract (ara+eng) and build a DOCX.
-
-    Rendering via PyMuPDF at 200 DPI (faster than 300; adequate quality).
-    OCR with LSTM engine (--oem 1) for best Arabic accuracy.
-    RTL detection applied per line same as Tier 1.
-
-    Returns True on success, False on any error.
-    """
     try:
-        import fitz  # pymupdf
+        import fitz
         import pytesseract
         from docx import Document
+    except ImportError as exc:
+        logger.warning(f"Tier 2 skipped – missing dep: {exc}")
+        return False
 
-        # Verify tesseract binary is present
-        try:
-            subprocess.run(
-                ["tesseract", "--version"],
-                capture_output=True,
-                timeout=10,
-                check=True,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            logger.warning(f"Tier 2 skipped — tesseract not found: {exc}")
-            return False
+    try:
+        subprocess.run(["tesseract", "--version"],
+                       capture_output=True, timeout=10, check=True)
+    except Exception as exc:
+        logger.warning(f"Tier 2 skipped – tesseract not found: {exc}")
+        return False
 
+    try:
         doc_pdf = fitz.open(input_path)
         doc_word = Document()
 
-        for para in doc_word.paragraphs:
-            p = para._element
-            p.getparent().remove(p)
+        for p in list(doc_word.paragraphs):
+            p._element.getparent().remove(p._element)
 
-        total_paragraphs = 0
+        _configure_doc_rtl_defaults(doc_word)
+
+        total_paras = 0
 
         for page_num in range(len(doc_pdf)):
             page = doc_pdf[page_num]
@@ -510,131 +716,108 @@ def _tier2_tesseract_ocr_to_docx(input_path: str, output_path: str) -> bool:
             if page_num > 0:
                 _add_page_break(doc_word)
 
-            # 200 DPI — faster than 300, still good Arabic OCR accuracy
-            pil_image = _render_page_to_pil(page, dpi=200)
-
+            pil_img = _render_page_pil(page, dpi=200)
             ocr_text = pytesseract.image_to_string(
-                pil_image,
+                pil_img,
                 lang="ara+eng",
                 config="--psm 3 --oem 1",
             )
 
             if not ocr_text or not ocr_text.strip():
-                logger.info(f"Tier 2: page {page_num + 1} returned empty OCR")
                 continue
 
             for line in ocr_text.split("\n"):
                 line = line.strip()
                 if not line:
                     continue
-                _add_styled_paragraph(doc_word, line)
-                total_paragraphs += 1
+
+                rtl = _is_rtl_span(line)
+                para = doc_word.add_paragraph()
+                _set_para_bidi(para, rtl)
+                _set_para_spacing(para)
+
+                run = para.add_run(line)
+                _make_run_rtl_props(run, font_name="Amiri",
+                                    font_size_pt=11.0, rtl=rtl)
+                total_paras += 1
 
         doc_pdf.close()
 
-        if total_paragraphs == 0:
-            logger.warning("Tier 2: no text extracted via OCR")
+        if total_paras == 0:
+            logger.warning("Tier 2: no text from OCR")
             return False
 
         doc_word.save(output_path)
         logger.info(
-            f"Tier 2 (Tesseract OCR) succeeded: {total_paragraphs} paragraphs, "
-            f"{Path(output_path).stat().st_size} bytes"
+            f"Tier 2 (Tesseract) OK: "
+            f"{total_paras} paras, {Path(output_path).stat().st_size} bytes"
         )
         return True
 
-    except ImportError as exc:
-        logger.warning(f"Tier 2 skipped — missing dependency: {exc}")
-        return False
     except Exception as exc:
         logger.warning(f"Tier 2 failed: {exc}", exc_info=True)
         return False
 
 
 # ===========================================================================
-# Tier 3: LibreOffice fallback
+# Tier 3 — LibreOffice fallback
 # ===========================================================================
 
-def _run_lo(
-    lo_bin: str,
-    extra_args: list,
-    input_file: Path,
-    out_dir: Path,
-) -> subprocess.CompletedProcess:
+def _run_lo(lo_bin: str, extra_args: list,
+            input_file: Path, out_dir: Path) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["LANG"] = "en_US.UTF-8"
     env["LC_ALL"] = "en_US.UTF-8"
-    cmd = [
-        lo_bin,
-        "--headless",
-        "--norestore",
-        "--nofirststartwizard",
-        *extra_args,
-        "--outdir", str(out_dir),
-        str(input_file),
-    ]
-    logger.info(f"LO running: {' '.join(cmd)}")
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+    cmd = [lo_bin, "--headless", "--norestore", "--nofirststartwizard",
+           *extra_args, "--outdir", str(out_dir), str(input_file)]
+    logger.info(f"LO: {' '.join(cmd)}")
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          timeout=120, env=env)
 
 
 def _tier3_libreoffice_fallback(input_path: str, output_path: str) -> bool:
-    """
-    LibreOffice-based last resort. Tries writer_pdf_import → direct → ODT→DOCX.
-    May produce rasterized images for Arabic PDFs but kept as a safety net.
-
-    Returns True on success, False if all LibreOffice strategies fail.
-    """
     lo_bin = find_libreoffice()
     if not lo_bin:
-        logger.warning("Tier 3 skipped — LibreOffice not found")
+        logger.warning("Tier 3 skipped – LibreOffice not found")
         return False
 
     input_file = Path(input_path)
     output_file = Path(output_path)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        tmp_path = Path(tmp_dir)
+        tmp = Path(tmp_dir)
 
-        # 3a: writer_pdf_import filter
-        result = _run_lo(
-            lo_bin,
-            ["--infilter=writer_pdf_import", "--convert-to", "docx"],
-            input_file, tmp_path,
-        )
-        docx_files = list(tmp_path.glob("*.docx"))
-        if docx_files:
-            shutil.move(str(docx_files[0]), str(output_file))
-            logger.info(f"Tier 3a (writer_pdf_import) succeeded: {output_file.stat().st_size} bytes")
+        # 3a writer_pdf_import
+        _run_lo(lo_bin, ["--infilter=writer_pdf_import", "--convert-to", "docx"],
+                input_file, tmp)
+        hits = list(tmp.glob("*.docx"))
+        if hits:
+            shutil.move(str(hits[0]), str(output_file))
+            logger.info(f"Tier 3a OK: {output_file.stat().st_size} bytes")
             return True
-        logger.warning(f"Tier 3a failed. rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}")
 
-        # 3b: direct convert
-        result = _run_lo(lo_bin, ["--convert-to", "docx"], input_file, tmp_path)
-        docx_files = list(tmp_path.glob("*.docx"))
-        if docx_files:
-            shutil.move(str(docx_files[0]), str(output_file))
-            logger.info(f"Tier 3b (direct) succeeded: {output_file.stat().st_size} bytes")
+        # 3b direct
+        _run_lo(lo_bin, ["--convert-to", "docx"], input_file, tmp)
+        hits = list(tmp.glob("*.docx"))
+        if hits:
+            shutil.move(str(hits[0]), str(output_file))
+            logger.info(f"Tier 3b OK: {output_file.stat().st_size} bytes")
             return True
-        logger.warning(f"Tier 3b failed. rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}")
 
-        # 3c: PDF -> ODT -> DOCX two-step
-        odt_dir = tmp_path / "odt"
-        odt_dir.mkdir()
-        result = _run_lo(lo_bin, ["--convert-to", "odt"], input_file, odt_dir)
-        odt_files = list(odt_dir.glob("*.odt"))
-        if odt_files:
-            docx_dir = tmp_path / "docx"
-            docx_dir.mkdir()
-            result2 = _run_lo(lo_bin, ["--convert-to", "docx"], odt_files[0], docx_dir)
-            docx_files = list(docx_dir.glob("*.docx"))
-            if docx_files:
-                shutil.move(str(docx_files[0]), str(output_file))
-                logger.info(f"Tier 3c (ODT->DOCX) succeeded: {output_file.stat().st_size} bytes")
+        # 3c PDF→ODT→DOCX
+        odt_dir = tmp / "odt"; odt_dir.mkdir()
+        _run_lo(lo_bin, ["--convert-to", "odt"], input_file, odt_dir)
+        odt_hits = list(odt_dir.glob("*.odt"))
+        if odt_hits:
+            docx_dir = tmp / "docx"; docx_dir.mkdir()
+            _run_lo(lo_bin, ["--convert-to", "docx"], odt_hits[0], docx_dir)
+            hits = list(docx_dir.glob("*.docx"))
+            if hits:
+                shutil.move(str(hits[0]), str(output_file))
+                logger.info(f"Tier 3c OK: {output_file.stat().st_size} bytes")
                 return True
-            logger.warning(f"Tier 3c step2 failed. rc={result2.returncode} stdout={result2.stdout!r} stderr={result2.stderr!r}")
-        else:
-            logger.warning(f"Tier 3c step1 failed. rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}")
 
+    logger.warning("Tier 3: all LibreOffice strategies failed")
     return False
 
 
@@ -644,55 +827,40 @@ def _tier3_libreoffice_fallback(input_path: str, output_path: str) -> bool:
 
 def convert_pdf_to_docx(input_path: str, output_path: str) -> None:
     """
-    Convert a PDF to DOCX with Arabic/RTL support and layout preservation.
+    Convert PDF to DOCX with full Arabic/RTL support.
 
-    Tier 1: PyMuPDF rich extraction -> python-docx
-            Preserves: font sizes, bold/italic, headings, embedded images
-            Fast: pure Python, no subprocess
-    Tier 2: Tesseract OCR -> python-docx (scanned/image-based PDFs)
-            200 DPI for speed, ara+eng LSTM for accuracy
-    Tier 3: LibreOffice headless (last resort for all edge cases)
-
-    Args:
-        input_path:  Absolute path to the input PDF.
-        output_path: Absolute path where the output DOCX will be saved.
-
-    Raises:
-        RuntimeError: If all tiers fail.
+    Raises RuntimeError if all tiers fail.
     """
-    input_file = Path(input_path)
-    output_file = Path(output_path)
+    in_file = Path(input_path)
+    out_file = Path(output_path)
 
-    if not input_file.exists():
-        raise RuntimeError(f"Input file not found: {input_path}")
+    if not in_file.exists():
+        raise RuntimeError(f"Input not found: {input_path}")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
 
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(f"PDF→DOCX: {in_file.name}")
 
-    logger.info(f"Converting PDF -> DOCX: {input_file.name}")
+    text_based = is_text_based_pdf(input_path)
+    logger.info(f"PDF type: {'text-based' if text_based else 'image/scanned'}")
 
-    pdf_is_text_based = is_text_based_pdf(input_path)
-    logger.info(f"PDF type: {'text-based' if pdf_is_text_based else 'image-based (scanned)'}")
-
-    if pdf_is_text_based:
-        # Text-based: try PyMuPDF first (fast, rich layout), then OCR, then LO
+    if text_based:
         if _tier1_pymupdf_to_docx(input_path, output_path):
             return
-        logger.warning("Tier 1 failed — trying Tier 2 (OCR)")
+        logger.warning("Tier 1 failed → Tier 2 (OCR)")
         if _tier2_tesseract_ocr_to_docx(input_path, output_path):
             return
-        logger.warning("Tier 2 failed — trying Tier 3 (LibreOffice)")
+        logger.warning("Tier 2 failed → Tier 3 (LibreOffice)")
         if _tier3_libreoffice_fallback(input_path, output_path):
             return
     else:
-        # Image-based: skip Tier 1, go straight to OCR
-        logger.info("Image-based PDF — starting with Tier 2 (Tesseract OCR)")
+        logger.info("Scanned PDF → Tier 2 (OCR)")
         if _tier2_tesseract_ocr_to_docx(input_path, output_path):
             return
-        logger.warning("Tier 2 failed — trying Tier 3 (LibreOffice)")
+        logger.warning("Tier 2 failed → Tier 3 (LibreOffice)")
         if _tier3_libreoffice_fallback(input_path, output_path):
             return
 
     raise RuntimeError(
-        "PDF->DOCX conversion failed with all strategies. "
-        "The PDF may be encrypted, password-protected, or severely corrupted."
+        "All conversion strategies failed. "
+        "PDF may be encrypted, corrupted, or use an unsupported encoding."
     )
