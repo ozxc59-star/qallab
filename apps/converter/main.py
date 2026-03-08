@@ -91,6 +91,81 @@ async def health():
     )
 
 
+@app.get("/debug/lo-version")
+async def lo_version():
+    """Debug: return LibreOffice version and available filters."""
+    import subprocess, shutil
+    lo_bin = shutil.which("libreoffice") or shutil.which("soffice") or "/usr/bin/libreoffice"
+    try:
+        v = subprocess.run([lo_bin, "--version"], capture_output=True, text=True, timeout=10)
+        # Check if pdfimport extension is installed
+        ext = subprocess.run(
+            [lo_bin, "--headless", "--norestore", "--unaccept", "socket,host=localhost,port=2002;urp;StarOffice.ServiceManager"],
+            capture_output=True, text=True, timeout=5
+        )
+        return {
+            "version": v.stdout.strip(),
+            "stderr": v.stderr.strip(),
+            "lo_bin": lo_bin,
+            "pdfimport_installed": "pdfimport" in (v.stdout + v.stderr).lower(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/debug/test-pdf-convert")
+async def test_pdf_convert():
+    """Debug: test PDF->DOCX with a minimal PDF and return full LO output."""
+    import subprocess, shutil, tempfile
+    from pathlib import Path
+
+    lo_bin = shutil.which("libreoffice") or "/usr/bin/libreoffice"
+
+    # Minimal valid PDF
+    pdf_bytes = b"""%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj
+4 0 obj<</Length 44>>stream
+BT /F1 12 Tf 100 700 Td (Hello) Tj ET
+endstream endobj
+5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj
+xref
+0 6
+0000000000 65535 f\r
+0000000009 00000 n\r
+0000000058 00000 n\r
+0000000115 00000 n\r
+0000000274 00000 n\r
+0000000370 00000 n\r
+trailer<</Size 6/Root 1 0 R>>
+startxref
+441
+%%EOF"""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path = Path(tmp) / "test.pdf"
+        out_dir = Path(tmp) / "out"
+        out_dir.mkdir()
+        pdf_path.write_bytes(pdf_bytes)
+
+        cmd = [lo_bin, "--headless", "--norestore", "--nofirststartwizard",
+               "--infilter=writer_pdf_import", "--convert-to", "docx",
+               "--outdir", str(out_dir), str(pdf_path)]
+
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        files = list(out_dir.glob("*"))
+
+        return {
+            "returncode": r.returncode,
+            "stdout": r.stdout,
+            "stderr": r.stderr,
+            "files_produced": [f.name for f in files],
+            "lo_bin": lo_bin,
+            "cmd": " ".join(cmd),
+        }
+
+
 @app.post("/convert", response_model=ConversionResult)
 async def convert(
     job_id: str = Form(...),
