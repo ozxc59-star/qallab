@@ -1,6 +1,6 @@
 # قلّب Converter Service
 # LibreOffice + Arabic fonts for accurate Arabic document conversion
-# Build: 2026-03-08-v3
+# Build: 2026-03-09-v4
 
 FROM python:3.12-slim
 
@@ -12,6 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-draw \
     libreoffice-java-common \
     default-jre-headless \
+    # Tesseract OCR for scanned/image-based Arabic PDFs
+    tesseract-ocr \
+    tesseract-ocr-ara \
+    tesseract-ocr-eng \
     # Arabic fonts — critical for correct rendering
     fonts-hosny-amiri \
     fonts-arabeyes \
