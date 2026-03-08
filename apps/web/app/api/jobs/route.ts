@@ -54,13 +54,30 @@ async function convertViaExternalService(
     fileName
   );
 
-  const response = await fetch(`${CONVERTER_URL}/convert`, {
-    method: "POST",
-    headers: { "X-API-Key": CONVERTER_API_KEY! },
-    body: converterForm,
-  });
+  let response: Response;
+  try {
+    // 120 second timeout — covers cold starts on Render free tier
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120_000);
+    response = await fetch(`${CONVERTER_URL}/convert`, {
+      method: "POST",
+      headers: { "X-API-Key": CONVERTER_API_KEY! },
+      body: converterForm,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+  } catch {
+    await updateJob(jobId, { status: "error", error: "conversionFailed" });
+    return;
+  }
 
-  const result = await response.json();
+  let result: { success?: boolean; error?: string; output_key?: string };
+  try {
+    result = await response.json();
+  } catch {
+    await updateJob(jobId, { status: "error", error: "conversionFailed" });
+    return;
+  }
 
   if (!response.ok || !result.success) {
     await updateJob(jobId, {
