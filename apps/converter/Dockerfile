@@ -5,7 +5,7 @@ FROM python:3.12-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # LibreOffice for DOCX→PDF (best Arabic text shaping)
+    # LibreOffice for all conversions (PDF↔DOCX) with proper Arabic support
     libreoffice \
     libreoffice-writer \
     # Arabic fonts — critical for correct rendering
@@ -13,11 +13,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-arabeyes \
     fonts-noto-core \
     fonts-noto-extra \
+    # Arabic locale support for proper RTL text shaping
+    locales \
     # libmagic for file type validation
     libmagic1 \
-    # Cleanup
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Generate Arabic and English locales
+RUN echo "ar_AE.UTF-8 UTF-8" >> /etc/locale.gen && \
+    echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen && \
+    locale-gen
 
 # Refresh font cache
 RUN fc-cache -f -v

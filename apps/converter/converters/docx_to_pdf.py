@@ -12,6 +12,7 @@ and works reliably in Docker containers.
 """
 
 import logging
+import os
 import subprocess
 import shutil
 from pathlib import Path
@@ -68,11 +69,18 @@ def convert_docx_to_pdf(input_path: str, output_path: str) -> None:
 
     logger.info(f"Converting DOCX → PDF: {input_file.name}")
 
-    # LibreOffice writes the PDF in the same directory as input,
-    # so we use a temp dir and then move to output_path.
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp_dir:
+        # Set environment for proper Arabic/RTL and font rendering
+        env = os.environ.copy()
+        env["LANG"] = "ar_AE.UTF-8"
+        env["LC_ALL"] = "ar_AE.UTF-8"
+        # Fallback if Arabic locale not installed on the system
+        if not _locale_exists("ar_AE.UTF-8"):
+            env["LANG"] = "en_US.UTF-8"
+            env["LC_ALL"] = "en_US.UTF-8"
+
         cmd = [
             lo_bin,
             "--headless",
@@ -88,7 +96,8 @@ def convert_docx_to_pdf(input_path: str, output_path: str) -> None:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=120,  # 2 minutes max
+                timeout=120,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError("LibreOffice conversion timed out (>2 minutes)")
@@ -115,3 +124,17 @@ def convert_docx_to_pdf(input_path: str, output_path: str) -> None:
     logger.info(
         f"DOCX→PDF conversion complete: {output_file.stat().st_size} bytes"
     )
+
+
+def _locale_exists(locale: str) -> bool:
+    """Check if a locale is available on the system."""
+    try:
+        result = subprocess.run(
+            ["locale", "-a"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return locale.lower().replace("-", "") in result.stdout.lower().replace("-", "")
+    except Exception:
+        return False
