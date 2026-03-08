@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # LibreOffice for all conversions (PDF↔DOCX) with proper Arabic support
     libreoffice \
     libreoffice-writer \
+    # PDF import extension — required for PDF→DOCX via writer_pdf_import filter
+    libreoffice-pdfimport \
     # Arabic fonts — critical for correct rendering
     fonts-hosny-amiri \
     fonts-arabeyes \
