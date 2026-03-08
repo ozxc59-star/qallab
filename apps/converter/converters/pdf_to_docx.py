@@ -2,10 +2,12 @@
 PDF → DOCX conversion using LibreOffice headless.
 
 LibreOffice handles Arabic/RTL text, complex scripts, and mixed
-bidirectional content far better than pdf2docx which loses Arabic text.
+bidirectional content correctly. It uses the built-in PDF import
+filter (writer_pdf_import) to open the PDF then exports to DOCX.
 """
 
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -33,7 +35,7 @@ def convert_pdf_to_docx(input_path: str, output_path: str) -> None:
     """
     Convert a PDF file to DOCX using LibreOffice headless.
 
-    LibreOffice is used instead of pdf2docx because it correctly handles:
+    Uses LibreOffice's PDF import filter which correctly handles:
     - Arabic / RTL text
     - Mixed bidirectional content
     - Complex Arabic script shaping
@@ -60,13 +62,20 @@ def convert_pdf_to_docx(input_path: str, output_path: str) -> None:
 
     logger.info(f"Converting PDF → DOCX: {input_file.name}")
 
+    env = os.environ.copy()
+    env["LANG"] = "en_US.UTF-8"
+    env["LC_ALL"] = "en_US.UTF-8"
+
     with tempfile.TemporaryDirectory() as tmp_dir:
+        # Use infilter to open PDF with the PDF import filter,
+        # then convert-to docx to export as Word format
         cmd = [
             lo_bin,
             "--headless",
             "--norestore",
             "--nofirststartwizard",
-            "--convert-to", "docx:MS Word 2007 XML",
+            "--infilter=writer_pdf_import",
+            "--convert-to", "docx",
             "--outdir", tmp_dir,
             str(input_file),
         ]
@@ -77,6 +86,7 @@ def convert_pdf_to_docx(input_path: str, output_path: str) -> None:
                 capture_output=True,
                 text=True,
                 timeout=120,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError("LibreOffice conversion timed out (>2 minutes)")
@@ -91,6 +101,9 @@ def convert_pdf_to_docx(input_path: str, output_path: str) -> None:
 
         generated = list(Path(tmp_dir).glob("*.docx"))
         if not generated:
+            # Log stdout/stderr to understand why no file was produced
+            logger.error(f"LibreOffice stdout: {result.stdout}")
+            logger.error(f"LibreOffice stderr: {result.stderr}")
             raise RuntimeError("LibreOffice did not produce a DOCX output")
 
         shutil.move(str(generated[0]), str(output_file))
