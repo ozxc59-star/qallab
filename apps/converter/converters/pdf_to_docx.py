@@ -2,8 +2,8 @@
 PDF → DOCX conversion using LibreOffice headless.
 
 LibreOffice handles Arabic/RTL text, complex scripts, and mixed
-bidirectional content correctly. It uses the built-in PDF import
-filter (writer_pdf_import) to open the PDF then exports to DOCX.
+bidirectional content correctly. Multiple conversion strategies are
+tried in order to maximise compatibility across different environments.
 """
 
 import logging
@@ -31,22 +31,38 @@ def find_libreoffice() -> str | None:
     return None
 
 
+def _run_lo(lo_bin: str, extra_args: list, input_file: Path, out_dir: Path) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["LANG"] = "en_US.UTF-8"
+    env["LC_ALL"] = "en_US.UTF-8"
+    cmd = [
+        lo_bin,
+        "--headless",
+        "--norestore",
+        "--nofirststartwizard",
+        *extra_args,
+        "--outdir", str(out_dir),
+        str(input_file),
+    ]
+    logger.info(f"Running: {' '.join(cmd)}")
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+
+
 def convert_pdf_to_docx(input_path: str, output_path: str) -> None:
     """
     Convert a PDF file to DOCX using LibreOffice headless.
 
-    Uses LibreOffice's PDF import filter which correctly handles:
-    - Arabic / RTL text
-    - Mixed bidirectional content
-    - Complex Arabic script shaping
-    - Arabic fonts embedded in PDFs
+    Tries multiple strategies in order:
+    1. writer_pdf_import filter (best quality, needs libreoffice-pdfimport)
+    2. Direct PDF open without filter (LibreOffice Draw fallback)
+    3. PDF → ODT → DOCX two-step (most compatible)
 
     Args:
         input_path: Absolute path to the input PDF file.
         output_path: Absolute path where the output DOCX will be saved.
 
     Raises:
-        RuntimeError: If LibreOffice is not available or conversion fails.
+        RuntimeError: If all strategies fail.
     """
     lo_bin = find_libreoffice()
     if not lo_bin:
@@ -62,53 +78,53 @@ def convert_pdf_to_docx(input_path: str, output_path: str) -> None:
 
     logger.info(f"Converting PDF → DOCX: {input_file.name}")
 
-    env = os.environ.copy()
-    env["LANG"] = "en_US.UTF-8"
-    env["LC_ALL"] = "en_US.UTF-8"
-
     with tempfile.TemporaryDirectory() as tmp_dir:
-        # Use infilter to open PDF with the PDF import filter,
-        # then convert-to docx to export as Word format
-        cmd = [
-            lo_bin,
-            "--headless",
-            "--norestore",
-            "--nofirststartwizard",
-            "--infilter=writer_pdf_import",
-            "--convert-to", "docx",
-            "--outdir", tmp_dir,
-            str(input_file),
-        ]
+        tmp_path = Path(tmp_dir)
 
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("LibreOffice conversion timed out (>2 minutes)")
-        except Exception as e:
-            raise RuntimeError(f"Failed to run LibreOffice: {e}") from e
+        # ── Strategy 1: writer_pdf_import filter ──────────────────────────
+        result = _run_lo(lo_bin, ["--infilter=writer_pdf_import", "--convert-to", "docx"],
+                         input_file, tmp_path)
+        docx_files = list(tmp_path.glob("*.docx"))
+        if docx_files:
+            shutil.move(str(docx_files[0]), str(output_file))
+            logger.info(f"Strategy 1 (writer_pdf_import) succeeded: {output_file.stat().st_size} bytes")
+            return
 
-        if result.returncode != 0:
-            logger.error(f"LibreOffice stderr: {result.stderr}")
-            raise RuntimeError(
-                f"LibreOffice exited with code {result.returncode}: {result.stderr[:500]}"
-            )
+        logger.warning(f"Strategy 1 failed. rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}")
 
-        generated = list(Path(tmp_dir).glob("*.docx"))
-        if not generated:
-            # Log stdout/stderr to understand why no file was produced
-            logger.error(f"LibreOffice stdout: {result.stdout}")
-            logger.error(f"LibreOffice stderr: {result.stderr}")
-            raise RuntimeError("LibreOffice did not produce a DOCX output")
+        # ── Strategy 2: direct convert without filter ─────────────────────
+        result = _run_lo(lo_bin, ["--convert-to", "docx"],
+                         input_file, tmp_path)
+        docx_files = list(tmp_path.glob("*.docx"))
+        if docx_files:
+            shutil.move(str(docx_files[0]), str(output_file))
+            logger.info(f"Strategy 2 (direct) succeeded: {output_file.stat().st_size} bytes")
+            return
 
-        shutil.move(str(generated[0]), str(output_file))
+        logger.warning(f"Strategy 2 failed. rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}")
 
-    if not output_file.exists() or output_file.stat().st_size == 0:
-        raise RuntimeError("Conversion produced an empty or missing output file")
+        # ── Strategy 3: PDF → ODT → DOCX two-step ────────────────────────
+        odt_dir = tmp_path / "odt"
+        odt_dir.mkdir()
+        result = _run_lo(lo_bin, ["--convert-to", "odt"],
+                         input_file, odt_dir)
+        odt_files = list(odt_dir.glob("*.odt"))
 
-    logger.info(f"PDF→DOCX conversion complete: {output_file.stat().st_size} bytes")
+        if odt_files:
+            docx_dir = tmp_path / "docx"
+            docx_dir.mkdir()
+            result2 = _run_lo(lo_bin, ["--convert-to", "docx"],
+                              odt_files[0], docx_dir)
+            docx_files = list(docx_dir.glob("*.docx"))
+            if docx_files:
+                shutil.move(str(docx_files[0]), str(output_file))
+                logger.info(f"Strategy 3 (ODT→DOCX) succeeded: {output_file.stat().st_size} bytes")
+                return
+            logger.warning(f"Strategy 3 step2 failed. rc={result2.returncode} stdout={result2.stdout!r} stderr={result2.stderr!r}")
+        else:
+            logger.warning(f"Strategy 3 step1 (ODT) failed. rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}")
+
+        raise RuntimeError(
+            "PDF→DOCX conversion failed with all strategies. "
+            "The PDF may be encrypted, image-only (scanned), or corrupted."
+        )
