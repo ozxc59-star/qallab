@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: qallab
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    buildCommand: ""
+    envVars:
+      - key: PORT
+        value: 8000

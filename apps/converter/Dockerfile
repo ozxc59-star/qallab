@@ -1,5 +1,6 @@
 # قلّب Converter Service
 # LibreOffice + Arabic fonts for accurate Arabic document conversion
+# Build: 2026-03-08-v2
 
 FROM python:3.12-slim
 
